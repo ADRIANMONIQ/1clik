@@ -1,0 +1,894 @@
+﻿import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+from urllib.request import urlopen
+
+from PIL import Image
+
+
+BASE_DIR = Path(__file__).resolve().parent
+VENDOR_DIR = BASE_DIR / "vendor"
+if VENDOR_DIR.exists() and str(VENDOR_DIR) not in sys.path:
+    sys.path.insert(0, str(VENDOR_DIR))
+PROFILE_DIR = Path(os.environ.get("ONECLIK_PROFILE_DIR") or BASE_DIR / "data" / "chrome-profile")
+CDP_PORT = int(os.environ.get("ONECLIK_CDP_PORT", "9341"))
+CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
+WHATSAPP_URL = "https://web.whatsapp.com"
+_THREAD_SESSION = threading.local()
+_ACCOUNT_PHONE = None
+
+
+def _session(cdp_port=None, profile_dir=None):
+    port = int(cdp_port or CDP_PORT)
+    profile = Path(profile_dir) if profile_dir else PROFILE_DIR
+    return port, profile, f"http://127.0.0.1:{port}"
+
+
+def status(timeout=1, cdp_port=None, profile_dir=None):
+    _, _, cdp_url = _session(cdp_port, profile_dir)
+    try:
+        with urlopen(f"{cdp_url}/json/version", timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+        return {"ok": True, "running": True, "connected": _is_connected(cdp_port, profile_dir), "cdp": cdp_url, "browser": data.get("Browser", "")}
+    except Exception as exc:
+        return {"ok": True, "running": False, "connected": False, "cdp": cdp_url, "error": str(exc)[:240]}
+
+
+def _chrome_path():
+    roots = [os.environ.get("PROGRAMFILES", ""), os.environ.get("PROGRAMFILES(X86)", ""), os.environ.get("LOCALAPPDATA", "")]
+    for root in roots:
+        for relative in ("Google/Chrome/Application/chrome.exe", "Microsoft/Edge/Application/msedge.exe"):
+            candidate = Path(root) / relative
+            if candidate.exists():
+                return str(candidate)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            if Path(playwright.chromium.executable_path).exists():
+                return playwright.chromium.executable_path
+    except Exception:
+        pass
+    return ""
+
+
+def start(cdp_port=None, profile_dir=None):
+    port, profile, _ = _session(cdp_port, profile_dir)
+    current = status(cdp_port=port, profile_dir=profile)
+    if current.get("running"):
+        return {**current, "started": False, "url": WHATSAPP_URL}
+    executable = _chrome_path()
+    if not executable:
+        return {"ok": False, "running": False, "status": "chrome_nao_encontrado", "error": "Chrome ou Edge nao encontrado."}
+    profile.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen([
+        executable, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+        "--no-first-run", "--no-default-browser-check", "--disable-popup-blocking", "--new-window", WHATSAPP_URL,
+    ], cwd=str(BASE_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        time.sleep(0.5)
+        current = status(cdp_port=port, profile_dir=profile)
+        if current.get("running"):
+            return {**current, "started": True, "url": WHATSAPP_URL}
+    return {"ok": False, "running": False, "status": "falha_ao_abrir", "error": "O navegador abriu, mas nao respondeu na porta do 1Clik."}
+
+
+def _page(cdp_port=None, profile_dir=None):
+    _, _, cdp_url = _session(cdp_port, profile_dir)
+    from playwright.sync_api import sync_playwright
+    # Playwright's synchronous runtime is thread-bound.  The 1Clik runs the
+    # connection keepalive, campaigns and Test WhatsApp in separate threads;
+    # sharing one global runtime made a connected browser look disconnected in
+    # another thread and could trigger an unnecessary new Chrome window.
+    runtime = getattr(_THREAD_SESSION, "playwright", None)
+    if runtime is None:
+        runtime = sync_playwright().start()
+        _THREAD_SESSION.playwright = runtime
+        _THREAD_SESSION.browsers = {}
+    browsers = getattr(_THREAD_SESSION, "browsers", {})
+    browser = browsers.get(cdp_url)
+    if browser is None or not browser.is_connected():
+        browser = runtime.chromium.connect_over_cdp(cdp_url, timeout=5000)
+        browsers[cdp_url] = browser
+        _THREAD_SESSION.browsers = browsers
+    context = browser.contexts[0] if browser.contexts else browser.new_context()
+    page = next((item for item in context.pages if "web.whatsapp.com" in (item.url or "")), None)
+    if page is None:
+        page = context.new_page()
+    page.set_default_timeout(2000)
+    return runtime, browser, page
+
+
+def _is_connected(cdp_port=None, profile_dir=None):
+    if not status_without_connection_check(cdp_port=cdp_port, profile_dir=profile_dir).get("running"):
+        return False
+    # The first CDP attach can briefly fail while Chrome is restoring the saved
+    # WhatsApp profile.  Retry before showing a false red/offline indicator.
+    for attempt in range(3):
+        try:
+            # A WhatsApp tab being open does not mean the account is connected.
+            # Confirm the authenticated chat UI instead of treating the QR/login
+            # screen as a successful connection.
+            playwright, browser, page = _page(cdp_port, profile_dir)
+            if "web.whatsapp.com" not in (page.url or ""):
+                return False
+            connected_selectors = (
+                "#pane-side",
+                '[data-testid="chat-list"]',
+                '[role="grid"]',
+                '[aria-label="Lista de conversas"]',
+                '[aria-label="Chat list"]',
+            )
+            for selector in connected_selectors:
+                try:
+                    if page.locator(selector).count() and page.locator(selector).first.is_visible():
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(0.25)
+    return False
+
+
+def _connected_account_phone(cdp_port=None, profile_dir=None):
+    """Read and cache the account number from the authenticated profile panel."""
+    global _ACCOUNT_PHONE
+    if _ACCOUNT_PHONE:
+        return _ACCOUNT_PHONE
+    page = None
+    try:
+        _, _, page = _page(cdp_port, profile_dir)
+        profile_button = page.locator('[aria-label="Perfil"]').last
+        profile_button.wait_for(state="visible", timeout=1500)
+        profile_button.click(timeout=3000)
+        page.wait_for_timeout(350)
+        body = page.locator("body").inner_text(timeout=2000)
+        matches = re.findall(r"\+\d{1,3}(?:[\s-]\d{1,4}){2,4}", body)
+        for value in matches:
+            digits = re.sub(r"\D", "", value)
+            if len(digits) >= 12:
+                _ACCOUNT_PHONE = value.strip()
+                return _ACCOUNT_PHONE
+    except Exception:
+        return None
+    finally:
+        if page is not None:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+    return None
+
+
+def status_without_connection_check(timeout=1, cdp_port=None, profile_dir=None):
+    _, _, cdp_url = _session(cdp_port, profile_dir)
+    try:
+        with urlopen(f"{cdp_url}/json/version", timeout=timeout):
+            return {"running": True}
+    except Exception:
+        return {"running": False}
+
+
+def _click_first(page, selectors, timeout=2000):
+    for selector in selectors:
+        try:
+            item = page.locator(selector).last
+            item.wait_for(state="visible", timeout=timeout)
+            item.click()
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _visible_last(locator):
+    """Return the last visible match, ignoring hidden WhatsApp editors."""
+    visible = []
+    for index in range(locator.count()):
+        item = locator.nth(index)
+        try:
+            if item.is_visible():
+                visible.append(item)
+        except Exception:
+            continue
+    return visible[-1] if visible else None
+
+
+def _close_current_whatsapp_page(page):
+    """Close the tab that is stuck on an invalid WhatsApp number.
+
+    The sender opens a dedicated WhatsApp tab through CDP.  Closing that tab
+    is the programmatic equivalent of clicking its X.  The next queue item
+    will create/reopen a clean WhatsApp page through ``_page`` and must not be
+    treated as a delivery failure caused by the browser session.
+    """
+    try:
+        page.close(run_before_unload=False)
+    except Exception:
+        try:
+            page.keyboard.press("Control+W")
+        except Exception:
+            pass
+
+
+def _clear_new_chat_search(page):
+    """Clear WhatsApp's New chat search without closing the browser tab."""
+    selectors = (
+        'button[aria-label="Limpar pesquisa"]',
+        'button[aria-label="Clear search"]',
+        '[data-icon="x-alt"]',
+    )
+    if _click_first(page, selectors, timeout=1200):
+        return True
+    try:
+        search = page.locator(
+            'input[aria-label^="Pesquisar nome"],input[aria-label^="Search name"]'
+        ).first
+        if search.count() and search.is_visible():
+            search.fill("", timeout=3000)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _new_chat_has_no_results(page):
+    try:
+        text = (page.locator("body").inner_text(timeout=1500) or "").casefold()
+    except Exception:
+        return False
+    return (
+        "nenhum resultado encontrado para" in text
+        or "no results found for" in text
+    )
+
+
+def _wait_for_chat_or_phone_error(page, timeout_ms=90000):
+    """Wait for a usable composer, but stop early for non-WhatsApp numbers."""
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    composer = page.locator('[contenteditable="true"][role="textbox"]')
+    phone_error_texts = (
+        "não está no whatsapp",
+        "nao esta no whatsapp",
+        "isn't on whatsapp",
+        "is not on whatsapp",
+        "not on whatsapp",
+        "nenhum resultado encontrado para",
+        "no results found for",
+    )
+    while time.monotonic() < deadline:
+        visible_composer = _visible_last(composer)
+        if visible_composer is not None:
+            return True
+        try:
+            body_text = (page.locator("body").inner_text(timeout=2000) or "").casefold()
+            if any(message in body_text for message in phone_error_texts):
+                # Close WhatsApp's blocking dialog before advancing. Otherwise
+                # the next contact cannot open and the whole queue appears stuck.
+                ok_button = page.get_by_role("button", name="OK", exact=True)
+                if ok_button.count() and ok_button.first.is_visible():
+                    ok_button.first.click(timeout=3000)
+                return False
+        except Exception:
+            pass
+        page.wait_for_timeout(250)
+    raise RuntimeError("campo de mensagem nao apareceu dentro do tempo limite")
+
+
+def _open_chat_without_reload(page, target, timeout_ms=20000):
+    """Switch contacts through WhatsApp's New chat panel without reloading the app."""
+    try:
+        search = page.locator(
+            'input[aria-label^="Pesquisar nome"],input[aria-label^="Search name"]'
+        ).first
+        if not search.count() or not search.is_visible():
+            new_chat = page.locator('button[aria-label="Nova conversa"],button[aria-label="New chat"]').first
+            new_chat.wait_for(state="visible", timeout=5000)
+            new_chat.click(timeout=5000)
+            search = page.locator(
+                'input[aria-label^="Pesquisar nome"],input[aria-label^="Search name"]'
+            ).first
+        search.wait_for(state="visible", timeout=5000)
+        search.fill(target, timeout=5000)
+        suffix = target[-8:]
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        result = None
+        while time.monotonic() < deadline:
+            if _new_chat_has_no_results(page):
+                _clear_new_chat_search(page)
+                return None
+            candidates = page.locator('[role="button"]')
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                try:
+                    if candidate.is_visible() and "".join(char for char in (candidate.inner_text() or "") if char.isdigit()).endswith(suffix):
+                        result = candidate
+                        break
+                except Exception:
+                    continue
+            if result is not None:
+                break
+            page.wait_for_timeout(250)
+        if result is None:
+            return False
+        result.click(timeout=8000)
+        if not _wait_for_chat_or_phone_error(page, timeout_ms=15000):
+            return False
+        composer = _visible_last(page.locator('[contenteditable="true"][role="textbox"]'))
+        if composer is None:
+            return False
+        aria = "".join(char for char in (composer.get_attribute("aria-label") or "") if char.isdigit())
+        return not aria or aria.endswith(suffix)
+    except Exception:
+        return False
+
+
+def _open_chat_with_recovery(page, target, timeout_ms=20000):
+    """Open a recipient without repeatedly navigating to /send?phone=..."""
+    first_attempt = _open_chat_without_reload(page, target, timeout_ms=timeout_ms)
+    if first_attempt is True:
+        return True
+    if first_attempt is None:
+        return None
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    try:
+        page.goto(WHATSAPP_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_selector(
+            '#pane-side,[data-testid="chat-list"],[role="grid"],'
+            '[aria-label="Lista de conversas"],[aria-label="Chat list"]',
+            state="visible",
+            timeout=90000,
+        )
+        return _open_chat_without_reload(page, target, timeout_ms=max(timeout_ms, 30000))
+    except Exception:
+        return False
+
+
+def _visible_inbound_replies(page):
+    """Return replies shown after the most recent outbound message.
+
+    WhatsApp exposes the remote phone inside each private-chat message id.  We
+    deliberately ignore groups and messages before our last outbound message,
+    so opening an old conversation cannot create a false campaign response.
+    """
+    return page.evaluate(
+        r"""() => {
+          const messages = [...document.querySelectorAll('[data-testid="msg-container"]')];
+          let lastOutbound = -1;
+          const isOutgoing = (node) => Boolean(
+            node.closest('.message-out') || node.querySelector('[data-testid="tail-out"]') ||
+            [...node.querySelectorAll('[aria-label]')].some((item) => /^(voc[eê]|you):?$/i.test(item.getAttribute('aria-label') || ''))
+          );
+          messages.forEach((node, index) => {
+            if (isOutgoing(node)) lastOutbound = index;
+          });
+          const headerText = document.querySelector('#main header')?.innerText || '';
+          const headerPhone = (headerText.match(/\+?\d[\d\s().-]{8,}\d/) || [''])[0].replace(/\D/g, '');
+          return messages.slice(lastOutbound + 1).flatMap((node) => {
+            const incoming = Boolean(node.closest('.message-in') || node.querySelector('[data-testid="tail-in"]'));
+            if (!incoming || isOutgoing(node)) return [];
+            const identified = node.closest('[data-id]') || node.querySelector('[data-id]');
+            let messageId = identified?.getAttribute('data-id') || '';
+            const match = messageId.match(/_(\d+)@c\.us_/);
+            const phone = match?.[1] || headerPhone;
+            if (!phone) return [];
+            const selectable = node.querySelector('[data-testid="selectable-text"]');
+            const text = (selectable?.innerText || node.innerText || '').trim();
+            if (!text) return [];
+            const pre = node.querySelector('[data-pre-plain-text]')?.getAttribute('data-pre-plain-text') || '';
+            messageId ||= `${phone}|${pre}|${text}`;
+            return [{phone, message_id: messageId, text}];
+          });
+        }"""
+    )
+
+
+def collect_web_replies(cdp_port=None, profile_dir=None, max_chats=30, campaign_phones=None):
+    """Read campaign replies from the connected QR-Code WhatsApp session.
+
+    The collector never sends content. It first reads the currently open chat,
+    then opens chats marked unread so their private phone/message ids can be
+    captured. Database deduplication is performed by the caller.
+    """
+    if not _is_connected(cdp_port=cdp_port, profile_dir=profile_dir):
+        return {"ok": False, "status": "conexao_offline", "replies": []}
+    try:
+        _, _, page = _page(cdp_port, profile_dir)
+        replies = list(_visible_inbound_replies(page) or [])
+        # A reply may already have been opened manually and therefore no longer
+        # carries an unread badge. Inspect visible campaign conversations too.
+        wanted_suffixes = {
+            "".join(char for char in str(phone or "") if char.isdigit())[-8:]
+            for phone in (campaign_phones or [])
+            if len("".join(char for char in str(phone or "") if char.isdigit())) >= 8
+        }
+        rows = page.locator('#pane-side [role="row"],#pane-side [role="listitem"]')
+        for index in range(rows.count()):
+            row = rows.nth(index)
+            try:
+                if not row.is_visible():
+                    continue
+                row_digits = "".join(char for char in (row.inner_text() or "") if char.isdigit())
+                if not any(suffix and suffix in row_digits for suffix in wanted_suffixes):
+                    continue
+                row.click(timeout=3000, force=True)
+                page.wait_for_timeout(800)
+                replies.extend(_visible_inbound_replies(page) or [])
+            except Exception:
+                continue
+        seen_chats = set()
+        unread_selector = (
+            '#pane-side [aria-label*="mensagem não lida" i],'
+            '#pane-side [aria-label*="mensagens não lidas" i],'
+            '#pane-side [aria-label*="unread message" i],'
+            '#pane-side [aria-label*="unread messages" i],'
+            '#pane-side [data-testid="icon-unread-count"]'
+        )
+        for _ in range(max(0, int(max_chats))):
+            markers = page.locator(unread_selector)
+            marker = _visible_last(markers)
+            if marker is None:
+                break
+            row = marker.locator('xpath=ancestor::*[@role="row" or @role="listitem"][1]')
+            if not row.count():
+                row = marker.locator('xpath=ancestor::div[@tabindex="-1"][1]')
+            if not row.count():
+                break
+            fingerprint = (row.first.inner_text(timeout=1500) or "")[:160]
+            if fingerprint in seen_chats:
+                break
+            seen_chats.add(fingerprint)
+            row.first.click(timeout=3000)
+            page.wait_for_timeout(450)
+            replies.extend(_visible_inbound_replies(page) or [])
+        unique = {}
+        for reply in replies:
+            key = str(reply.get("message_id") or "")
+            if key:
+                unique[key] = reply
+        return {"ok": True, "status": "coletado", "replies": list(unique.values())}
+    except Exception as exc:
+        return {"ok": False, "status": "falha_leitura", "error": str(exc)[:300], "replies": []}
+
+
+def check_number(phone, cdp_port=None, profile_dir=None, timeout_ms=8000):
+    """Check whether a number appears in WhatsApp Web without sending a message.
+
+    The result is deliberately three-state.  Only an explicit empty-result
+    signal is classified as ``nao_tem_whatsapp``; connection and UI failures
+    remain ``inconclusivo`` so a valid contact is never silently discarded.
+    """
+    digits = "".join(character for character in str(phone or "") if character.isdigit())
+    if digits.startswith("55") and len(digits) in (12, 13):
+        target = digits
+    elif len(digits) in (10, 11):
+        target = "55" + digits
+    else:
+        return {"ok": False, "exists": None, "status": "numero_invalido", "error": "Número inválido com DDD."}
+    if not _is_connected(cdp_port=cdp_port, profile_dir=profile_dir):
+        return {"ok": False, "exists": None, "status": "conexao_offline", "error": "WhatsApp por QR Code não está conectado."}
+    try:
+        _, _, page = _page(cdp_port, profile_dir)
+        # WhatsApp currently renders the New chat search as a visible textbox
+        # with an empty aria-label. Reuse it when the panel is already open;
+        # attempting to click New chat again hits a disabled button and stalls.
+        search = _visible_last(page.locator(
+            'input[role="textbox"][aria-label=""],'
+            'input[aria-label^="Pesquisar nome"],input[aria-label^="Search name"]'
+        ))
+        if search is None:
+            new_chat = page.locator(
+                'button[aria-label="Nova conversa"],button[aria-label="New chat"],'
+                '[role="button"][aria-label="Nova conversa"],[role="button"][aria-label="New chat"]'
+            ).first
+            new_chat.wait_for(state="visible", timeout=5000)
+            new_chat.click(timeout=5000)
+            search = _visible_last(page.locator(
+                'input[role="textbox"][aria-label=""],'
+                'input[aria-label^="Pesquisar nome"],input[aria-label^="Search name"]'
+            ))
+        if search is None:
+            return {"ok": False, "exists": None, "status": "inconclusivo", "error": "Campo Nova conversa não localizado."}
+        search.wait_for(state="visible", timeout=5000)
+        search.fill(target, timeout=5000)
+        suffix = target[-8:]
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        empty_signals = (
+            "nenhum contato encontrado", "nenhum resultado", "no contacts found",
+            "no results", "não está no whatsapp", "nao esta no whatsapp",
+            "isn't on whatsapp", "is not on whatsapp",
+        )
+        while time.monotonic() < deadline:
+            candidates = page.locator('[role="button"]')
+            for index in range(candidates.count()):
+                candidate = candidates.nth(index)
+                try:
+                    candidate_digits = "".join(
+                        character for character in (candidate.inner_text() or "") if character.isdigit()
+                    )
+                    if candidate.is_visible() and candidate_digits.endswith(suffix):
+                        candidate.click(timeout=5000)
+                        if _wait_for_chat_or_phone_error(page, timeout_ms=5000):
+                            return {"ok": True, "exists": True, "status": "tem_whatsapp", "phone": target}
+                        return {"ok": True, "exists": False, "status": "nao_tem_whatsapp", "phone": target}
+                except Exception:
+                    continue
+            try:
+                body_text = (page.locator("body").inner_text(timeout=1500) or "").casefold()
+                if any(signal in body_text for signal in empty_signals):
+                    page.keyboard.press("Escape")
+                    return {"ok": True, "exists": False, "status": "nao_tem_whatsapp", "phone": target}
+            except Exception:
+                pass
+            page.wait_for_timeout(150)
+        page.keyboard.press("Escape")
+        return {"ok": False, "exists": None, "status": "inconclusivo", "error": "O WhatsApp não confirmou o número dentro do tempo esperado."}
+    except Exception as exc:
+        return {"ok": False, "exists": None, "status": "inconclusivo", "error": str(exc)[:300]}
+
+
+def check_numbers_via_group(phones, group_name="TESTE W", cdp_port=None, profile_dir=None, timeout_ms=12000):
+    """Validate a batch from WhatsApp's Start conversation linkification."""
+    normalized = []
+    for phone in phones:
+        digits = "".join(character for character in str(phone or "") if character.isdigit())
+        if len(digits) in (10, 11):
+            digits = "55" + digits
+        if digits.startswith("55") and len(digits) in (12, 13) and digits not in normalized:
+            normalized.append(digits)
+    if not normalized:
+        return {"ok": True, "results": {}}
+    if not _is_connected(cdp_port=cdp_port, profile_dir=profile_dir):
+        return {"ok": False, "error": "WhatsApp por QR Code não está conectado."}
+    try:
+        _, _, page = _page(cdp_port, profile_dir)
+        current_composer = _visible_last(page.locator('[contenteditable="true"][role="textbox"]'))
+        visible_group_titles = 0
+        titles = page.get_by_text(group_name, exact=True)
+        for title_index in range(titles.count()):
+            try:
+                if titles.nth(title_index).is_visible():
+                    visible_group_titles += 1
+            except Exception:
+                continue
+        group_is_open = current_composer is not None and visible_group_titles >= 2
+        # Leave the New chat number-search panel left by any previous check.
+        if not group_is_open:
+            new_chat_search = _visible_last(page.locator('input[role="textbox"][aria-label=""]'))
+            if new_chat_search is not None:
+                back = page.locator('button[aria-label="Voltar"],button[aria-label="Back"]').first
+                if back.count():
+                    back.click(timeout=3000, force=True)
+                    page.wait_for_timeout(300)
+            page.keyboard.press("Escape")
+            # TESTE W is intentionally pinned by the operator. Prefer the
+            # visible pinned row and avoid the fragile chat-search field.
+            group = _visible_last(page.locator(f'span[title="{group_name}"]'))
+            if group is None:
+                search = _visible_last(page.locator(
+                    'input[aria-label^="Pesquisar ou começar"],input[aria-label^="Search or start"]'
+                ))
+                if search is None:
+                    return {"ok": False, "error": f"Grupo fixado {group_name} não localizado."}
+                search.fill(group_name)
+                page.wait_for_timeout(300)
+                group = _visible_last(page.locator(f'span[title="{group_name}"]'))
+            if group is None:
+                return {"ok": False, "error": f"Grupo {group_name} não localizado na lista de conversas."}
+            row = group.locator("xpath=ancestor::div[@role='row'][1]")
+            (row if row.count() else group).click(timeout=3000, force=True)
+            page.wait_for_timeout(500)
+        message = datetime.now().strftime("%d/%m/%Y") + "\n" + "\n".join(normalized)
+        composer = _visible_last(page.locator('[contenteditable="true"][role="textbox"]'))
+        if composer is None:
+            return {"ok": False, "error": f"Campo de mensagem do grupo {group_name} não localizado."}
+        composer.fill(message)
+        composer.press("Enter")
+        first = page.get_by_text(normalized[0], exact=True).last
+        first.wait_for(state="visible", timeout=timeout_ms)
+        bubble = first.locator("xpath=ancestor::div[contains(@class,'message-out')][1]")
+        if not bubble.count():
+            bubble = first.locator("xpath=ancestor::*[@data-id][1]")
+        if not bubble.count():
+            return {"ok": False, "error": "Mensagem enviada, mas o resultado não pôde ser lido."}
+        results = {}
+        for phone in normalized:
+            rect = bubble.evaluate(
+                """(root, needle) => {
+                    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                    let node;
+                    while ((node = walker.nextNode())) {
+                        const index = (node.nodeValue || '').indexOf(needle);
+                        if (index >= 0) {
+                            const range = document.createRange();
+                            range.setStart(node, index);
+                            range.setEnd(node, index + needle.length);
+                            const box = range.getBoundingClientRect();
+                            return {x: box.x + box.width / 2, y: box.y + box.height / 2,
+                                    width: box.width, height: box.height};
+                        }
+                    }
+                    return null;
+                }""",
+                phone,
+            )
+            if not rect or rect.get("width", 0) <= 0:
+                results[phone] = None
+                continue
+            try:
+                page.mouse.click(rect["x"], rect["y"])
+                deadline = time.monotonic() + 1.8
+                menu_text = ""
+                options = page.locator('[role="menuitem"],[role="button"]')
+                while time.monotonic() < deadline:
+                    visible_texts = []
+                    for option_index in range(options.count()):
+                        option = options.nth(option_index)
+                        try:
+                            if option.is_visible():
+                                visible_texts.append(option.inner_text())
+                        except Exception:
+                            continue
+                    menu_text = "\n".join(visible_texts).casefold()
+                    if "copiar número" in menu_text or "copiar numero" in menu_text:
+                        break
+                    page.wait_for_timeout(80)
+                if "conversar com" in menu_text or "iniciar conversa" in menu_text:
+                    results[phone] = True
+                elif "copiar número" in menu_text or "copiar numero" in menu_text:
+                    results[phone] = False
+                else:
+                    results[phone] = None
+            except Exception:
+                results[phone] = None
+            finally:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(120)
+        return {"ok": True, "group": group_name, "results": results}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
+
+
+def _photo_upload_path(media):
+    """Force raster artwork to be uploaded as a photo, never as a sticker."""
+    if not media or media.suffix.lower() in (".jpg", ".jpeg"):
+        return media
+    if media.suffix.lower() not in (".png", ".webp", ".bmp", ".gif"):
+        return media
+    converted = media.with_name(media.stem + ".whatsapp.jpg")
+    if converted.exists() and converted.stat().st_mtime >= media.stat().st_mtime:
+        return converted
+    with Image.open(media) as source:
+        source.seek(0)
+        if source.mode in ("RGBA", "LA") or "transparency" in source.info:
+            rgba = source.convert("RGBA")
+            canvas = Image.new("RGB", rgba.size, "white")
+            canvas.paste(rgba, mask=rgba.getchannel("A"))
+            photo = canvas
+        else:
+            photo = source.convert("RGB")
+        photo.save(converted, "JPEG", quality=94, optimize=True)
+    return converted
+
+
+def send(phone, message="", media_path="", cdp_port=None, profile_dir=None):
+    opened = start(cdp_port, profile_dir)
+    if not opened.get("running"):
+        return {**opened, "ok": False}
+    target = "".join(char for char in str(phone or "") if char.isdigit())
+    if len(target) in (10, 11):
+        target = "55" + target
+    if len(target) < 12:
+        return {"ok": False, "status": "telefone_invalido", "error": "Informe DDD e telefone."}
+    media = Path(media_path) if media_path else None
+    if media and not media.exists():
+        return {"ok": False, "status": "midia_nao_encontrada", "error": "Arquivo de midia nao encontrado."}
+    playwright = None
+    try:
+        playwright, browser, page = _page(cdp_port, profile_dir)
+        page.bring_to_front()
+        # Change contacts through WhatsApp's own panel. This keeps the Web app
+        # loaded instead of showing the white loading screen for every number.
+        initial_text = message or ""
+        chat_result = _open_chat_with_recovery(page, target)
+        if chat_result is None:
+            _clear_new_chat_search(page)
+            return {
+                "ok": False,
+                "status": "numero_sem_whatsapp",
+                "error": "Nenhum resultado encontrado no WhatsApp.",
+                "telefone": target,
+            }
+        if chat_result is not True:
+            return {
+                "ok": False,
+                "status": "conversa_nao_aberta",
+                "error": "WhatsApp não abriu a conversa sem recarregar; contato mantido na fila.",
+                "telefone": target,
+            }
+        if not _wait_for_chat_or_phone_error(page):
+            _clear_new_chat_search(page)
+            return {
+                "ok": False,
+                "status": "numero_sem_whatsapp",
+                "error": "O número não está no WhatsApp.",
+                "telefone": target,
+            }
+        composer = _visible_last(page.locator('[contenteditable="true"][role="textbox"]'))
+        if composer is None:
+            raise RuntimeError("campo de mensagem nao encontrado")
+        if initial_text:
+            composer.fill(initial_text, timeout=10000)
+        if media:
+            upload_media = _photo_upload_path(media)
+            if message:
+                for _ in range(40):
+                    if (composer.inner_text() or "").strip():
+                        break
+                    page.wait_for_timeout(250)
+                else:
+                    raise RuntimeError("texto nao carregou antes da foto")
+            image_count_before = page.locator('[data-testid="msg-container"] [data-testid="image-thumb"]').count()
+            # The current WhatsApp Web renders the composer before enabling the
+            # attachment control. Give that control its own readiness wait so a
+            # slow chat load is not recorded as a failed delivery.
+            page.wait_for_selector(
+                'button[aria-label="Anexar"],button[aria-label="Attach"],span[data-icon="plus-rounded"]',
+                state="visible",
+                timeout=30000,
+            )
+            if not _click_first(page, [
+                'button[aria-label="Anexar"]',
+                'button[aria-label="Attach"]',
+                'button[title="Anexar"]',
+                'button[title="Attach"]',
+                'span[data-icon="plus-rounded"]',
+                'span[data-icon="plus"]',
+                'span[data-icon="clip"]',
+            ], 6000):
+                raise RuntimeError("botao de anexo nao encontrado")
+            photo_menu = page.get_by_text("Fotos e vídeos", exact=True)
+            if not photo_menu.count():
+                photo_menu = page.get_by_text("Photos & videos", exact=True)
+            if not photo_menu.count():
+                raise RuntimeError("opcao Fotos e videos nao encontrada")
+            with page.expect_file_chooser(timeout=12000) as chooser_info:
+                photo_menu.last.click(timeout=10000, force=True)
+            chooser_info.value.set_files(str(upload_media), timeout=10000)
+            page.wait_for_timeout(1800)
+            # WhatsApp replaces the normal composer with the media preview
+            # after the file is attached. Text filled before the attachment
+            # is therefore discarded; fill the caption in the preview itself.
+            if message:
+                preview_composer = _visible_last(
+                    page.locator('[contenteditable="true"][role="textbox"]')
+                )
+                if preview_composer is None:
+                    raise RuntimeError("campo de legenda nao encontrado na previa da foto")
+                preview_composer.fill(message, timeout=10000)
+            media_send_selector = '[role="button"][aria-label^="Enviar "][aria-label*="item selecionado"]'
+            sent = _click_first(page, [
+                media_send_selector,
+                '[role="button"][aria-label^="Send "][aria-label*="selected item"]',
+                'button[aria-label="Enviar"]',
+                'button[aria-label="Send"]',
+                '[role="button"][aria-label="Enviar"]',
+                '[role="button"][aria-label="Send"]',
+                'span[data-icon="wds-ic-send-filled"]',
+                'span[data-testid="wds-ic-send-filled"]',
+                'span[data-icon="send"]',
+                'span[data-icon="send-filled"]',
+            ], 8000)
+            if not sent:
+                # In some WhatsApp Web releases the media-preview arrow has no
+                # stable label. It is always the bottom-right preview control.
+                viewport = page.viewport_size or {"width": 1280, "height": 720}
+                page.mouse.click(viewport["width"] - 36, viewport["height"] - 36)
+            # The normal chat composer remains visible after a media send, so
+            # it cannot confirm delivery. The media-preview Send control itself
+            # disappears only after WhatsApp accepts the photo.
+            media_send_control = page.locator(media_send_selector)
+            for _ in range(3):
+                try:
+                    media_send_control.wait_for(state="hidden", timeout=5000)
+                    break
+                except Exception:
+                    if media_send_control.count() and media_send_control.first.is_visible():
+                        media_send_control.first.click(force=True, timeout=5000)
+            media_send_control.wait_for(state="hidden", timeout=7000)
+            # Avoid wait_for_function here: WhatsApp's strict CSP blocks
+            # string-evaluated JavaScript in newer builds. Poll the locator
+            # through Playwright instead.
+            image_deadline = time.monotonic() + 20
+            while time.monotonic() < image_deadline:
+                if page.locator('[data-testid="msg-container"] [data-testid="image-thumb"]').count() > image_count_before:
+                    break
+                page.wait_for_timeout(250)
+        else:
+            composer.click()
+            page.keyboard.press("Enter")
+        page.wait_for_timeout(2000)
+        return {"ok": True, "status": "enviado", "telefone": target, "media": media.name if media else ""}
+    except Exception as exc:
+        return {"ok": False, "status": "falha_no_envio", "error": str(exc)[:500]}
+
+
+def send_poll(phone, question, options, cdp_port=None, profile_dir=None, reuse_current_chat=False):
+    """Send a native WhatsApp Web poll with exactly one answer allowed."""
+    opened = start(cdp_port, profile_dir)
+    if not opened.get("running"):
+        return {**opened, "ok": False}
+    target = "".join(char for char in str(phone or "") if char.isdigit())
+    if len(target) in (10, 11):
+        target = "55" + target
+    choices = [str(item).strip() for item in (options or []) if str(item).strip()]
+    if len(target) < 12:
+        return {"ok": False, "status": "telefone_invalido", "error": "Informe DDD e telefone."}
+    if len(choices) < 2:
+        return {"ok": False, "status": "enquete_invalida", "error": "A enquete precisa de pelo menos duas opcoes."}
+    playwright = None
+    try:
+        playwright, browser, page = _page(cdp_port, profile_dir)
+        page.bring_to_front()
+        # Campaign delivery calls this immediately after sending the image and
+        # caption to the same customer. Reuse that open chat so WhatsApp does
+        # not visibly reload before opening the poll composer.
+        if not reuse_current_chat and not _open_chat_with_recovery(page, target):
+            return {
+                "ok": False,
+                "status": "conversa_nao_aberta",
+                "error": "WhatsApp não abriu a conversa sem recarregar; enquete mantida na fila.",
+                "telefone": target,
+            }
+        page.wait_for_selector('button[aria-label="Anexar"],button[aria-label="Attach"]', timeout=90000)
+        if not _click_first(page, ['button[aria-label="Anexar"]', 'button[aria-label="Attach"]'], 4000):
+            raise RuntimeError("botao de anexo nao encontrado para a enquete")
+        poll_menu = page.get_by_text("Enquete", exact=True)
+        if not poll_menu.count():
+            poll_menu = page.get_by_text("Poll", exact=True)
+        poll_menu.last.wait_for(state="visible", timeout=5000)
+        try:
+            poll_menu.last.click(timeout=10000)
+        except Exception:
+            # WhatsApp animates this attachment menu; a DOM click is safe once
+            # the item is visible and avoids a false failure while it moves.
+            poll_menu.last.evaluate("element => element.click()")
+        page.wait_for_selector('[data-testid="poll-question-input"]', timeout=10000)
+        page.locator('[data-testid="poll-question-input"]').fill(
+            question or "Como deseja continuar?", timeout=10000
+        )
+        for index, choice in enumerate(choices[:12]):
+            selector = f'[data-testid="poll-option-input-{index}"]'
+            option = page.locator(selector)
+            option.wait_for(state="visible", timeout=10000)
+            try:
+                option.fill(choice, timeout=10000)
+            except Exception:
+                # React may replace an option field just after the previous
+                # value is filled. Re-resolve it and type into the fresh node.
+                option = page.locator(selector)
+                option.click(timeout=10000)
+                page.keyboard.insert_text(choice)
+        multiple = page.locator('#polls-single-option-switch')
+        if multiple.count() and multiple.is_checked():
+            multiple.uncheck()
+        send_button = page.locator('[data-testid="poll-send-button"]')
+        send_button.wait_for(state="visible", timeout=15000)
+        send_button.click(timeout=10000, force=True)
+        send_button.wait_for(state="hidden", timeout=15000)
+        page.wait_for_timeout(1000)
+        return {"ok": True, "status": "enquete_enviada", "telefone": target, "options": choices}
+    except Exception as exc:
+        return {"ok": False, "status": "falha_na_enquete", "error": str(exc)[:500]}
+
